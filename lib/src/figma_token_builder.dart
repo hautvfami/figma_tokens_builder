@@ -12,6 +12,50 @@ class _CollectionData {
   _CollectionData(this.name, this.modeJsons);
 }
 
+/// The children of a token group, split into leaf tokens and sub-groups.
+///
+/// Insertion order is preserved so generated fields follow the JSON order.
+class _GroupShape {
+  final List<String> tokens;
+  final List<String> groups;
+
+  const _GroupShape(this.tokens, this.groups);
+
+  factory _GroupShape.of(Map<String, dynamic> json) {
+    final tokens = <String>[];
+    final groups = <String>[];
+
+    json.forEach((key, value) {
+      if (key.startsWith(r'$')) return;
+      if (value is! Map<String, dynamic>) return;
+
+      if (_isToken(value)) {
+        tokens.add(key);
+      } else {
+        final nested = _GroupShape.of(value);
+        if (!nested.isEmpty) groups.add(key);
+      }
+    });
+
+    return _GroupShape(tokens, groups);
+  }
+
+  bool get isEmpty => tokens.isEmpty && groups.isEmpty;
+
+  /// A leaf token has a `$value`. A group may declare a `$type` for its
+  /// children, so only treat it as a token when it has no child maps.
+  static bool _isToken(Map<String, dynamic> value) {
+    if (value.containsKey(r'$value')) return true;
+    if (value.containsKey(r'$type')) {
+      final hasChildren = value.entries.any(
+        (entry) => !entry.key.startsWith(r'$') && entry.value is Map,
+      );
+      return !hasChildren;
+    }
+    return false;
+  }
+}
+
 /// A [Builder] that reads Figma token JSON files and generates
 /// Dart ThemeExtension classes with typed values for each mode.
 ///
@@ -22,6 +66,9 @@ class _CollectionData {
 ///
 /// When a collection has only **one group**, tokens are flattened directly onto
 /// the ThemeExtension class (no sub-group nesting).
+///
+/// Groups can be nested to any depth (e.g. `font-size > Archived > fs-12`),
+/// producing one class per group level.
 class FigmaTokenBuilder implements Builder {
   final BuilderOptions options;
 
@@ -31,8 +78,7 @@ class FigmaTokenBuilder implements Builder {
       options.config['input_dir'] as String? ?? 'assets/figma';
   String get _outputDir =>
       options.config['output_dir'] as String? ?? 'lib/generated';
-  String get _baseClass =>
-      options.config['base_class'] as String? ?? 'Figma';
+  String get _baseClass => options.config['base_class'] as String? ?? 'Figma';
 
   @override
   Map<String, List<String>> get buildExtensions {
@@ -135,41 +181,25 @@ class FigmaTokenBuilder implements Builder {
     _CollectionData collection,
   ) {
     final firstJson = collection.modeJsons.values.first;
+    final shape = _GroupShape.of(firstJson);
 
-    // Separate flat tokens (have $type) from groups (nested maps without $type)
-    final flatTokens = <String>[];
-    final groups = <String, List<String>>{};
+    if (shape.isEmpty) return;
 
-    firstJson.forEach((key, value) {
-      if (key.startsWith(r'$')) return;
-      if (value is Map<String, dynamic>) {
-        if (value.containsKey(r'$type')) {
-          // Flat token: has $type/$value directly
-          flatTokens.add(key);
-        } else {
-          // Group: nested map containing tokens
-          final tokens = value.keys.where((k) => !k.startsWith(r'$')).toList();
-          if (tokens.isNotEmpty) {
-            groups[key] = tokens;
-          }
-        }
-      }
-    });
-
-    if (flatTokens.isEmpty && groups.isEmpty) return;
-
-    if (flatTokens.isNotEmpty && groups.isEmpty) {
+    if (shape.groups.isEmpty) {
       // All tokens are flat → generate flat class (no groups)
-      _generateFlatClassFromTokens(buffer, className, collection, flatTokens);
-    } else if (flatTokens.isEmpty && groups.length == 1) {
+      _generateFlatClassFromTokens(buffer, className, collection, shape.tokens);
+    } else if (shape.tokens.isEmpty && shape.groups.length == 1) {
       // Single group → flatten onto class
-      _generateFlatClass(buffer, className, collection, groups);
+      _generateFlatClass(
+        buffer,
+        className,
+        collection,
+        firstJson,
+        shape.groups.single,
+      );
     } else {
       // Multiple groups (and/or mix of flat + grouped) → nested classes
-      if (flatTokens.isNotEmpty) {
-        groups['_root'] = flatTokens;
-      }
-      _generateNestedClass(buffer, className, collection, groups);
+      _generateNestedClass(buffer, className, collection, firstJson, shape);
     }
   }
 
@@ -249,26 +279,47 @@ class FigmaTokenBuilder implements Builder {
   }
 
   /// Single group → flatten tokens onto class (legacy grouped format).
-
+  ///
+  /// Sub-groups inside the flattened group become fields that reference their
+  /// own generated classes (e.g. `fontSize.archived.fs12`).
   void _generateFlatClass(
     StringBuffer b,
     String className,
     _CollectionData collection,
-    Map<String, List<String>> groups,
+    Map<String, dynamic> firstJson,
+    String groupName,
   ) {
-    final groupName = groups.keys.first;
-    final tokens = groups[groupName]!;
+    final groupJson = firstJson[groupName] as Map<String, dynamic>;
+    final shape = _GroupShape.of(groupJson);
+    final path = [groupName];
+
+    // Sub-group classes
+    for (final g in shape.groups) {
+      _writeGroupClass(b, _groupClassName(className, [...path, g]), className, [
+        ...path,
+        g,
+      ], groupJson[g] as Map<String, dynamic>);
+    }
 
     b.writeln('class $className extends ThemeExtension<$className> {');
 
-    for (final t in tokens) {
+    for (final t in shape.tokens) {
       b.writeln('  final double ${_toCamelCase(t)};');
+    }
+    for (final g in shape.groups) {
+      b.writeln(
+        '  final ${_groupClassName(className, [...path, g])} '
+        '${_toCamelCase(g)};',
+      );
     }
     b.writeln();
 
     b.writeln('  const $className({');
-    for (final t in tokens) {
+    for (final t in shape.tokens) {
       b.writeln('    required this.${_toCamelCase(t)},');
+    }
+    for (final g in shape.groups) {
+      b.writeln('    required this.${_toCamelCase(g)},');
     }
     b.writeln('  });');
     b.writeln();
@@ -278,9 +329,21 @@ class FigmaTokenBuilder implements Builder {
     for (final modeName in sortedModes) {
       final json = collection.modeJsons[modeName]!;
       b.writeln('  static const ${_toCamelCase(modeName)} = $className(');
-      for (final t in tokens) {
-        final value = _extractValue(json, groupName, t);
+      for (final t in shape.tokens) {
+        final value = _extractAtPath(json, [...path, t]);
         b.writeln('    ${_toCamelCase(t)}: ${value.toDouble()},');
+      }
+      for (final g in shape.groups) {
+        _writeGroupValue(
+          b,
+          '    ',
+          _toCamelCase(g),
+          _groupClassName(className, [...path, g]),
+          className,
+          [...path, g],
+          groupJson[g] as Map<String, dynamic>,
+          json,
+        );
       }
       b.writeln('  );');
       b.writeln();
@@ -291,13 +354,23 @@ class FigmaTokenBuilder implements Builder {
     // copyWith
     b.writeln('  @override');
     b.writeln('  $className copyWith({');
-    for (final t in tokens) {
+    for (final t in shape.tokens) {
       b.writeln('    double? ${_toCamelCase(t)},');
+    }
+    for (final g in shape.groups) {
+      b.writeln(
+        '    ${_groupClassName(className, [...path, g])}? '
+        '${_toCamelCase(g)},',
+      );
     }
     b.writeln('  }) {');
     b.writeln('    return $className(');
-    for (final t in tokens) {
+    for (final t in shape.tokens) {
       final camel = _toCamelCase(t);
+      b.writeln('      $camel: $camel ?? this.$camel,');
+    }
+    for (final g in shape.groups) {
+      final camel = _toCamelCase(g);
       b.writeln('      $camel: $camel ?? this.$camel,');
     }
     b.writeln('    );');
@@ -309,15 +382,25 @@ class FigmaTokenBuilder implements Builder {
     b.writeln('  $className lerp(covariant $className? other, double t) {');
     b.writeln('    if (other == null) return this;');
     b.writeln('    return $className(');
-    for (final t in tokens) {
+    for (final t in shape.tokens) {
       final camel = _toCamelCase(t);
       b.writeln('      $camel: $camel + (other.$camel - $camel) * t,');
+    }
+    for (final g in shape.groups) {
+      final camel = _toCamelCase(g);
+      b.writeln(
+        '      $camel: ${_groupClassName(className, [...path, g])}'
+        '.lerp($camel, other.$camel, t),',
+      );
     }
     b.writeln('    );');
     b.writeln('  }');
     b.writeln();
 
-    _writeHashEquals(b, className, tokens.map(_toCamelCase).toList());
+    _writeHashEquals(b, className, [
+      ...shape.tokens.map(_toCamelCase),
+      ...shape.groups.map(_toCamelCase),
+    ]);
 
     b.writeln('}');
     b.writeln();
@@ -331,67 +414,45 @@ class FigmaTokenBuilder implements Builder {
     StringBuffer b,
     String className,
     _CollectionData collection,
-    Map<String, List<String>> groups,
+    Map<String, dynamic> firstJson,
+    _GroupShape rootShape,
   ) {
-    // Sub-group classes
-    groups.forEach((groupName, tokens) {
-      final groupClass = '_${className}_${_toPascalCase(groupName)}Group';
-      b.writeln('class $groupClass {');
+    // Root-level flat tokens are grouped into a synthetic "root" group.
+    final rootJson = <String, dynamic>{
+      for (final t in rootShape.tokens) t: firstJson[t],
+    };
+    final rootClass = '_${className}_RootGroup';
+    final hasRoot = rootShape.tokens.isNotEmpty;
 
-      for (final t in tokens) {
-        b.writeln('  final double ${_toCamelCase(t)};');
-      }
-      b.writeln();
-
-      b.writeln('  const $groupClass({');
-      for (final t in tokens) {
-        b.writeln('    required this.${_toCamelCase(t)},');
-      }
-      b.writeln('  });');
-      b.writeln();
-
-      b.writeln('  $groupClass copyWith({');
-      for (final t in tokens) {
-        b.writeln('    double? ${_toCamelCase(t)},');
-      }
-      b.writeln('  }) {');
-      b.writeln('    return $groupClass(');
-      for (final t in tokens) {
-        final camel = _toCamelCase(t);
-        b.writeln('      $camel: $camel ?? this.$camel,');
-      }
-      b.writeln('    );');
-      b.writeln('  }');
-      b.writeln();
-
-      b.writeln(
-        '  static $groupClass lerp($groupClass a, $groupClass b, double t) {',
-      );
-      b.writeln('    return $groupClass(');
-      for (final t in tokens) {
-        final camel = _toCamelCase(t);
-        b.writeln('      $camel: a.$camel + (b.$camel - a.$camel) * t,');
-      }
-      b.writeln('    );');
-      b.writeln('  }');
-
-      b.writeln('}');
-      b.writeln();
-    });
+    // Sub-group classes (recursive, arbitrary depth)
+    for (final g in rootShape.groups) {
+      _writeGroupClass(b, _groupClassName(className, [g]), className, [
+        g,
+      ], firstJson[g] as Map<String, dynamic>);
+    }
+    if (hasRoot) {
+      _writeGroupClass(b, rootClass, className, const [], rootJson);
+    }
 
     // Main ThemeExtension class
     b.writeln('class $className extends ThemeExtension<$className> {');
 
-    for (final g in groups.keys) {
+    for (final g in rootShape.groups) {
       b.writeln(
-        '  final _${className}_${_toPascalCase(g)}Group ${_toCamelCase(g)};',
+        '  final ${_groupClassName(className, [g])} ${_toCamelCase(g)};',
       );
+    }
+    if (hasRoot) {
+      b.writeln('  final $rootClass root;');
     }
     b.writeln();
 
     b.writeln('  const $className({');
-    for (final g in groups.keys) {
+    for (final g in rootShape.groups) {
       b.writeln('    required this.${_toCamelCase(g)},');
+    }
+    if (hasRoot) {
+      b.writeln('    required this.root,');
     }
     b.writeln('  });');
     b.writeln();
@@ -401,16 +462,30 @@ class FigmaTokenBuilder implements Builder {
     for (final modeName in sortedModes) {
       final json = collection.modeJsons[modeName]!;
       b.writeln('  static const ${_toCamelCase(modeName)} = $className(');
-      groups.forEach((groupName, tokens) {
-        b.writeln(
-          '    ${_toCamelCase(groupName)}: _${className}_${_toPascalCase(groupName)}Group(',
+      for (final g in rootShape.groups) {
+        _writeGroupValue(
+          b,
+          '    ',
+          _toCamelCase(g),
+          _groupClassName(className, [g]),
+          className,
+          [g],
+          firstJson[g] as Map<String, dynamic>,
+          json,
         );
-        for (final t in tokens) {
-          final value = _extractValue(json, groupName, t);
-          b.writeln('      ${_toCamelCase(t)}: ${value.toDouble()},');
-        }
-        b.writeln('    ),');
-      });
+      }
+      if (hasRoot) {
+        _writeGroupValue(
+          b,
+          '    ',
+          'root',
+          rootClass,
+          className,
+          const [],
+          rootJson,
+          json,
+        );
+      }
       b.writeln('  );');
       b.writeln();
     }
@@ -420,16 +495,20 @@ class FigmaTokenBuilder implements Builder {
     // copyWith
     b.writeln('  @override');
     b.writeln('  $className copyWith({');
-    for (final g in groups.keys) {
-      b.writeln(
-        '    _${className}_${_toPascalCase(g)}Group? ${_toCamelCase(g)},',
-      );
+    for (final g in rootShape.groups) {
+      b.writeln('    ${_groupClassName(className, [g])}? ${_toCamelCase(g)},');
+    }
+    if (hasRoot) {
+      b.writeln('    $rootClass? root,');
     }
     b.writeln('  }) {');
     b.writeln('    return $className(');
-    for (final g in groups.keys) {
+    for (final g in rootShape.groups) {
       final camel = _toCamelCase(g);
       b.writeln('      $camel: $camel ?? this.$camel,');
+    }
+    if (hasRoot) {
+      b.writeln('      root: root ?? this.root,');
     }
     b.writeln('    );');
     b.writeln('  }');
@@ -440,17 +519,24 @@ class FigmaTokenBuilder implements Builder {
     b.writeln('  $className lerp(covariant $className? other, double t) {');
     b.writeln('    if (other == null) return this;');
     b.writeln('    return $className(');
-    for (final g in groups.keys) {
+    for (final g in rootShape.groups) {
       final camel = _toCamelCase(g);
       b.writeln(
-        '      $camel: _${className}_${_toPascalCase(g)}Group.lerp($camel, other.$camel, t),',
+        '      $camel: ${_groupClassName(className, [g])}'
+        '.lerp($camel, other.$camel, t),',
       );
+    }
+    if (hasRoot) {
+      b.writeln('      root: $rootClass.lerp(root, other.root, t),');
     }
     b.writeln('    );');
     b.writeln('  }');
     b.writeln();
 
-    _writeHashEquals(b, className, groups.keys.map(_toCamelCase).toList());
+    _writeHashEquals(b, className, [
+      ...rootShape.groups.map(_toCamelCase),
+      if (hasRoot) 'root',
+    ]);
 
     b.writeln('}');
     b.writeln();
@@ -459,6 +545,134 @@ class FigmaTokenBuilder implements Builder {
   // ---------------------------------------------------------------------------
   // Shared helpers
   // ---------------------------------------------------------------------------
+
+  /// Generates a plain class for one (possibly nested) token group.
+  ///
+  /// [path] is the key path from the mode JSON root to [groupJson], used both
+  /// for value lookup in presets and for stable nested class names.
+  void _writeGroupClass(
+    StringBuffer b,
+    String cls,
+    String rootClass,
+    List<String> path,
+    Map<String, dynamic> groupJson,
+  ) {
+    final shape = _GroupShape.of(groupJson);
+
+    // Nested group classes
+    for (final g in shape.groups) {
+      _writeGroupClass(b, _groupClassName(rootClass, [...path, g]), rootClass, [
+        ...path,
+        g,
+      ], groupJson[g] as Map<String, dynamic>);
+    }
+
+    b.writeln('class $cls {');
+
+    for (final t in shape.tokens) {
+      b.writeln('  final double ${_toCamelCase(t)};');
+    }
+    for (final g in shape.groups) {
+      b.writeln(
+        '  final ${_groupClassName(rootClass, [...path, g])} '
+        '${_toCamelCase(g)};',
+      );
+    }
+    b.writeln();
+
+    b.writeln('  const $cls({');
+    for (final t in shape.tokens) {
+      b.writeln('    required this.${_toCamelCase(t)},');
+    }
+    for (final g in shape.groups) {
+      b.writeln('    required this.${_toCamelCase(g)},');
+    }
+    b.writeln('  });');
+    b.writeln();
+
+    b.writeln('  $cls copyWith({');
+    for (final t in shape.tokens) {
+      b.writeln('    double? ${_toCamelCase(t)},');
+    }
+    for (final g in shape.groups) {
+      b.writeln(
+        '    ${_groupClassName(rootClass, [...path, g])}? '
+        '${_toCamelCase(g)},',
+      );
+    }
+    b.writeln('  }) {');
+    b.writeln('    return $cls(');
+    for (final t in shape.tokens) {
+      final camel = _toCamelCase(t);
+      b.writeln('      $camel: $camel ?? this.$camel,');
+    }
+    for (final g in shape.groups) {
+      final camel = _toCamelCase(g);
+      b.writeln('      $camel: $camel ?? this.$camel,');
+    }
+    b.writeln('    );');
+    b.writeln('  }');
+    b.writeln();
+
+    b.writeln('  static $cls lerp($cls a, $cls b, double t) {');
+    b.writeln('    return $cls(');
+    for (final t in shape.tokens) {
+      final camel = _toCamelCase(t);
+      b.writeln('      $camel: a.$camel + (b.$camel - a.$camel) * t,');
+    }
+    for (final g in shape.groups) {
+      final camel = _toCamelCase(g);
+      b.writeln(
+        '      $camel: ${_groupClassName(rootClass, [...path, g])}'
+        '.lerp(a.$camel, b.$camel, t),',
+      );
+    }
+    b.writeln('    );');
+    b.writeln('  }');
+
+    b.writeln('}');
+    b.writeln();
+  }
+
+  /// Emits `fieldName: Cls(...)` for a group, recursively, using values from
+  /// [modeJson]. Used when building static presets.
+  void _writeGroupValue(
+    StringBuffer b,
+    String indent,
+    String fieldName,
+    String cls,
+    String rootClass,
+    List<String> path,
+    Map<String, dynamic> groupJson,
+    Map<String, dynamic> modeJson,
+  ) {
+    b.writeln('$indent$fieldName: $cls(');
+
+    final shape = _GroupShape.of(groupJson);
+    for (final t in shape.tokens) {
+      final value = _extractAtPath(modeJson, [...path, t]);
+      b.writeln('$indent  ${_toCamelCase(t)}: ${value.toDouble()},');
+    }
+    for (final g in shape.groups) {
+      _writeGroupValue(
+        b,
+        '$indent  ',
+        _toCamelCase(g),
+        _groupClassName(rootClass, [...path, g]),
+        rootClass,
+        [...path, g],
+        groupJson[g] as Map<String, dynamic>,
+        modeJson,
+      );
+    }
+
+    b.writeln('$indent),');
+  }
+
+  /// Stable class name for a group at [path], e.g.
+  /// `_FigmaTypography_FontSizeArchivedGroup`.
+  String _groupClassName(String rootClass, List<String> path) =>
+      '_${rootClass}_${_toPascalCase(path.join('-'))}Group';
 
   void _writeHeader(StringBuffer b) {
     b.writeln('// GENERATED CODE - DO NOT MODIFY BY HAND');
@@ -607,27 +821,22 @@ class FigmaTokenBuilder implements Builder {
   // Utility methods
   // ---------------------------------------------------------------------------
 
-  num _extractValue(Map<String, dynamic> json, String group, String token) {
-    if (group == '_root') {
-      return _extractFlatValue(json, token);
+  /// Reads `$value` at [path] (e.g. `['font-size', 'Archived', 'fs-12']`).
+  num _extractAtPath(Map<String, dynamic> json, List<String> path) {
+    dynamic node = json;
+    for (final key in path) {
+      if (node is! Map<String, dynamic>) return 0;
+      node = node[key];
     }
-    final groupData = json[group] as Map<String, dynamic>?;
-    if (groupData == null) return 0;
-    final tokenData = groupData[token] as Map<String, dynamic>?;
-    if (tokenData == null) return 0;
-    final value = tokenData[r'$value'];
+    if (node is! Map<String, dynamic>) return 0;
+    final value = node[r'$value'];
     if (value is num) return value;
     return 0;
   }
 
   /// Extracts value from a flat token (no group nesting).
-  num _extractFlatValue(Map<String, dynamic> json, String token) {
-    final tokenData = json[token] as Map<String, dynamic>?;
-    if (tokenData == null) return 0;
-    final value = tokenData[r'$value'];
-    if (value is num) return value;
-    return 0;
-  }
+  num _extractFlatValue(Map<String, dynamic> json, String token) =>
+      _extractAtPath(json, [token]);
 
   String _getModeName(Map<String, dynamic> json, String path) {
     final extensions = json[r'$extensions'] as Map<String, dynamic>?;
