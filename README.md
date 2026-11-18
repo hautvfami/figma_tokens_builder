@@ -150,6 +150,23 @@ Tokens nested inside groups (maps without `$type`):
 
 → Generates sub-group classes: `FigmaImage.mobile.size.imageThumbnail`
 
+Groups can be nested to any depth, so archived or sub-categorized tokens keep
+their own namespace:
+
+```json
+{
+  "font-size": {
+    "label-sm": { "$type": "number", "$value": 12 },
+    "Archived": {
+      "fs-12": { "$type": "number", "$value": 12 }
+    }
+  }
+}
+```
+
+→ `FigmaTypography.mobile.fontSize.archived.fs12` (a nested group is never
+treated as a token, so no placeholder `0.0` value is generated).
+
 > **Mode name** is detected from `$extensions.com.figma.modeName`, or falls back to filename.
 
 ---
